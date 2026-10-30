@@ -176,6 +176,10 @@ static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
   if (slot == nullptr) { slot = new ObCuvsEntry(); slot->dim_ = dim; }
   if (slot->dim_ == 0) { slot->dim_ = dim; }
   if (slot->dim_ != dim) { return; }
+  if (slot->buf_ids_.capacity() < 262144) {
+    slot->buf_ids_.reserve(262144);
+    slot->buf_vecs_.reserve(262144 * static_cast<size_t>(dim));
+  }
   slot->buf_vecs_.insert(slot->buf_vecs_.end(), vectors,
                          vectors + static_cast<size_t>(dim) * size);
   slot->buf_ids_.insert(slot->buf_ids_.end(), ids, ids + size);
@@ -280,15 +284,40 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   const size_t n = ent->buf_ids_.size();
   const bool need_build =
       (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
-  std::vector<unsigned> off(topk);
-  std::vector<float> dst(topk);
-  ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
-  pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
-  pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
-  if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
-  pthread_attr_destroy(&attr);
-  if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
-  if (ent->bridge_ == nullptr || job.rc_ != 0) { return false; }
+
+  int rc = -1;
+  unsigned stack_off[128];
+  float stack_dst[128];
+  unsigned *off_ptr = stack_off;
+  float *dst_ptr = stack_dst;
+  std::vector<unsigned> heap_off;
+  std::vector<float> heap_dst;
+  if (topk > 128) {
+    heap_off.resize(topk);
+    heap_dst.resize(topk);
+    off_ptr = heap_off.data();
+    dst_ptr = heap_dst.data();
+  }
+
+  if (!need_build && ent->bridge_ != nullptr && ent->built_n_ == n) {
+    rc = seekdb_cuvs_search(ent->bridge_.get(), query, 1, topk, off_ptr, dst_ptr);
+  } else {
+    std::vector<unsigned> off(topk);
+    std::vector<float> dst(topk);
+    ObCuvsJob job{ent, query, topk, static_cast<int>(ent->dim_), n, need_build, &off, &dst, -1, false};
+    pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+    if (pthread_create(&tid, &attr, ob_cuvs_job, &job) == 0) { pthread_join(tid, nullptr); }
+    pthread_attr_destroy(&attr);
+    if (job.built_) { ob_vsag_trace("cuvs_build", key, static_cast<long>(ent->dim_), static_cast<long>(n)); }
+    rc = job.rc_;
+    for (int64_t i = 0; i < topk; ++i) {
+      off_ptr[i] = off[i];
+      dst_ptr[i] = dst[i];
+    }
+  }
+
+  if (ent->bridge_ == nullptr || rc != 0) { return false; }
   // Post-filter: cuVS returned UNFILTERED top-k. Apply the query's row filter
   // (WHERE predicate / deleted rows) with the SAME semantics VSAG uses: a row is
   // valid iff reverse_filter ? test(vid) : !test(vid). If ANY of the top-k is
@@ -296,7 +325,7 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   if (filter != nullptr) {
     FilterInterface *fi = static_cast<FilterInterface *>(filter);
     for (int64_t i = 0; i < topk; ++i) {
-      int64_t vid = (off[i] < ent->ids_.size()) ? static_cast<int64_t>(ent->ids_[off[i]]) : -1;
+      int64_t vid = (off_ptr[i] < ent->ids_.size()) ? static_cast<int64_t>(ent->ids_[off_ptr[i]]) : -1;
       const bool valid = reverse_filter ? fi->test(vid) : !fi->test(vid);
       if (!valid) { return false; }
     }
@@ -311,9 +340,9 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
     return false;
   }
   for (int64_t i = 0; i < topk; ++i) {
-    unsigned o = off[i];
+    unsigned o = off_ptr[i];
     out_ids[i] = (o < ent->ids_.size()) ? ent->ids_[o] : -1;
-    out_dist[i] = dst[i];
+    out_dist[i] = dst_ptr[i];
   }
   ids = out_ids; dist = out_dist; result_size = topk;
   ob_vsag_trace("cuvs_serve", key, static_cast<long>(topk), static_cast<long>(ent->ids_.size()));
@@ -429,7 +458,7 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     LOG_WARN("[OBVSAG][cuVS] failed to write snapshot stream", K(ret), KP(key), K(n));
     return true;
   }
-  std::vector<char> chunk(65536);
+  std::vector<char> chunk(4 * 1024 * 1024);
   uint64_t remaining = graph_bytes;
   while (remaining > 0) {
     const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
@@ -475,7 +504,7 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
       LOG_WARN("[OBVSAG][cuVS] truncated snapshot payload", K(ret), KP(key), K(n64));
     } else {
       ObCuvsSnapshotFile graph;
-      std::vector<char> chunk(65536);
+      std::vector<char> chunk(4 * 1024 * 1024);
       uint64_t remaining = graph_bytes;
       while (graph.file_ != nullptr && remaining > 0) {
         const size_t bytes = std::min<uint64_t>(remaining, chunk.size());

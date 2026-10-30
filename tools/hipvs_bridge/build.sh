@@ -23,7 +23,7 @@ mkdir -p "$(dirname "$OUTPUT")"
 "$HIPCC" \
   -shared \
   -fPIC \
-  -O2 \
+  -O3 \
   -D__HIP_PLATFORM_AMD__ \
   -I"$HIPVS_ROOT/include" \
   -I"$ROCM_ROOT/include" \
