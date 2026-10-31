@@ -49,14 +49,17 @@ cuvsError_t cuvsCagraIndexCreate(cuvsCagraIndex_t* p) { *p=new cuvsCagraIndex{};
 cuvsError_t cuvsCagraIndexDestroy(cuvsCagraIndex_t p) { delete p; --index_count; return CUVS_SUCCESS; }
 cuvsError_t cuvsCagraBuild(cuvsResources_t,cuvsCagraIndexParams_t p,DLManagedTensor* t,cuvsCagraIndex_t idx) {
   last_graph_degree=p->graph_degree; last_intermediate_degree=p->intermediate_graph_degree; last_niter=p->nn_descent_niter;
-  assert(p->graph_degree==expect_graph_degree && p->intermediate_graph_degree==expect_intermediate_degree && p->nn_descent_niter==expect_niter);
+  // The --benchmark comparison runs the frozen V5 bridge, whose defaults differ
+  // from the candidate's; parameter assertions belong to the main flow only.
+  if (!benchmark_mode) assert(p->graph_degree==expect_graph_degree && p->intermediate_graph_degree==expect_intermediate_degree && p->nn_descent_niter==expect_niter);
   if (!benchmark_mode) assert(t->manager_ctx==nullptr && t->deleter==nullptr);
   idx->n=t->dl_tensor.shape[0]; idx->dim=t->dl_tensor.shape[1]; return fail_build?CUVS_ERROR:CUVS_SUCCESS;
 }
 cuvsError_t cuvsCagraSearch(cuvsResources_t,cuvsCagraSearchParams_t p,cuvsCagraIndex_t idx,DLManagedTensor* q,DLManagedTensor* ids,DLManagedTensor* d,cuvsFilter) {
   assert(in_search.fetch_add(1)==0); std::this_thread::yield();
   if (!benchmark_mode) assert(q->manager_ctx==nullptr && q->deleter==nullptr);
-  last_itopk=p->itopk_size; last_search_width=p->search_width; assert(p->search_width==expect_search_width);
+  last_itopk=p->itopk_size; last_search_width=p->search_width;
+  if (!benchmark_mode) assert(p->search_width==expect_search_width);
   for(int64_t row=0; row<q->dl_tensor.shape[0]; ++row) {
     for(int64_t k=0; k<ids->dl_tensor.shape[1]; ++k) {
       auto pos=row*ids->dl_tensor.shape[1]+k;
