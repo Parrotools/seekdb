@@ -20,6 +20,9 @@ static int fail_alloc_after=-1, fail_copy_after=-1;
 static bool fail_build=false, fail_sync=false, fail_load=false, fail_search=false;
 static std::atomic<int> in_search{0};
 static size_t last_itopk=0;
+static size_t last_graph_degree=0, last_intermediate_degree=0, last_niter=0, last_search_width=0;
+// Expected bridge parameters; the sweep-override tests mutate these.
+static size_t expect_graph_degree=128, expect_intermediate_degree=256, expect_niter=100, expect_search_width=4;
 static bool benchmark_mode=false;
 static void balanced() { assert(allocations.empty()); assert(resource_count==0); assert(param_count==0); assert(index_count==0); }
 extern "C" {
@@ -45,14 +48,15 @@ cuvsError_t cuvsCagraSearchParamsDestroy(cuvsCagraSearchParams_t p) { delete p; 
 cuvsError_t cuvsCagraIndexCreate(cuvsCagraIndex_t* p) { *p=new cuvsCagraIndex{}; ++index_count; return CUVS_SUCCESS; }
 cuvsError_t cuvsCagraIndexDestroy(cuvsCagraIndex_t p) { delete p; --index_count; return CUVS_SUCCESS; }
 cuvsError_t cuvsCagraBuild(cuvsResources_t,cuvsCagraIndexParams_t p,DLManagedTensor* t,cuvsCagraIndex_t idx) {
-  assert(p->graph_degree==128 && p->intermediate_graph_degree==256 && p->nn_descent_niter==100);
+  last_graph_degree=p->graph_degree; last_intermediate_degree=p->intermediate_graph_degree; last_niter=p->nn_descent_niter;
+  assert(p->graph_degree==expect_graph_degree && p->intermediate_graph_degree==expect_intermediate_degree && p->nn_descent_niter==expect_niter);
   if (!benchmark_mode) assert(t->manager_ctx==nullptr && t->deleter==nullptr);
   idx->n=t->dl_tensor.shape[0]; idx->dim=t->dl_tensor.shape[1]; return fail_build?CUVS_ERROR:CUVS_SUCCESS;
 }
 cuvsError_t cuvsCagraSearch(cuvsResources_t,cuvsCagraSearchParams_t p,cuvsCagraIndex_t idx,DLManagedTensor* q,DLManagedTensor* ids,DLManagedTensor* d,cuvsFilter) {
   assert(in_search.fetch_add(1)==0); std::this_thread::yield();
   if (!benchmark_mode) assert(q->manager_ctx==nullptr && q->deleter==nullptr);
-  last_itopk=p->itopk_size; assert(p->search_width==4);
+  last_itopk=p->itopk_size; last_search_width=p->search_width; assert(p->search_width==expect_search_width);
   for(int64_t row=0; row<q->dl_tensor.shape[0]; ++row) {
     for(int64_t k=0; k<ids->dl_tensor.shape[1]; ++k) {
       auto pos=row*ids->dl_tensor.shape[1]+k;
@@ -81,6 +85,8 @@ cudaError_t cudaMemcpy(void* to,const void* from,size_t n,cudaMemcpyKind) {
 }
 int main(int argc,char** argv) {
   assert(argc==2); std::vector<float> base(1024*32), queries(8*32);
+  for(const char* v : {"OBCUVS_BUILD_ALGO","OBCUVS_GRAPH_DEGREE","OBCUVS_INTERMEDIATE_DEGREE",
+                       "OBCUVS_NNDESCENT_NITER","OBCUVS_ITOPK_MIN","OBCUVS_SEARCH_WIDTH"}) unsetenv(v);
   if (std::strcmp(argv[1], "--benchmark")==0) {
     benchmark_mode=true;
     void* h=seekdb_cuvs_build(base.data(),1024,32);assert(h);
@@ -130,6 +136,31 @@ int main(int argc,char** argv) {
     assert(seekdb_cuvs_search(h,big_queries.data(),40000,1,big_ids.data(),big_dist.data())==0);
     assert(allocations.empty()); // A large one-off request must not pin VRAM.
     assert(seekdb_cuvs_search(h,queries.data(),1,10,ids,dist)==0);
+  }
+  // Sweep overrides: OBCUVS_* must retarget build/search knobs, clamp
+  // intermediate below graph_degree, and fall back to defaults on junk input.
+  {
+    setenv("OBCUVS_GRAPH_DEGREE","64",1);
+    setenv("OBCUVS_INTERMEDIATE_DEGREE","32",1);
+    setenv("OBCUVS_NNDESCENT_NITER","25",1);
+    expect_graph_degree=64; expect_intermediate_degree=64; expect_niter=25;
+    void* sw=seekdb_cuvs_build(base.data(),1024,32); assert(sw);
+    assert(last_graph_degree==64 && last_intermediate_degree==64 && last_niter==25);
+    setenv("OBCUVS_ITOPK_MIN","256",1);
+    setenv("OBCUVS_SEARCH_WIDTH","2",1);
+    expect_search_width=2;
+    assert(seekdb_cuvs_search(sw,queries.data(),1,10,ids,dist)==0);
+    assert(last_itopk==256 && last_search_width==2);
+    seekdb_cuvs_free(sw); // Handle h is still alive and keeps its warm
+    // workspace, so global balance is only asserted at the end of main.
+    unsetenv("OBCUVS_GRAPH_DEGREE"); unsetenv("OBCUVS_INTERMEDIATE_DEGREE");
+    unsetenv("OBCUVS_NNDESCENT_NITER"); unsetenv("OBCUVS_ITOPK_MIN"); unsetenv("OBCUVS_SEARCH_WIDTH");
+    setenv("OBCUVS_GRAPH_DEGREE","not-a-number",1);
+    expect_graph_degree=128; expect_intermediate_degree=256; expect_niter=100; expect_search_width=4;
+    void* hd=seekdb_cuvs_build(base.data(),1024,32); assert(hd);
+    assert(last_graph_degree==128 && last_intermediate_degree==256 && last_niter==100);
+    seekdb_cuvs_free(hd);
+    unsetenv("OBCUVS_GRAPH_DEGREE");
   }
   assert(seekdb_cuvs_serialize(h,argv[1])==0);seekdb_cuvs_free(h);balanced();
   assert(!seekdb_cuvs_deserialize(argv[1],1023,32));balanced();

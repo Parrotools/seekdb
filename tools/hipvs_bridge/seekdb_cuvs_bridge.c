@@ -23,6 +23,8 @@ typedef struct {
   size_t query_bytes, ids_bytes, dist_bytes;
   cuvsCagraSearchParams_t sp;
   size_t default_itopk;
+  size_t itopk_min;
+  size_t search_width;
   pthread_mutex_t lock;
 } sk_cuvs_index;
 
@@ -88,6 +90,23 @@ fail:
   return NULL;
 }
 
+/* Experiment-only overrides for the bridge-level parameter sweep
+ * (tools/hipvs_bridge/sweep). The evaluation path never sets these variables,
+ * so defaults are the shipped configuration: the V5 graph-quality settings.
+ * Values are clamped so an out-of-range experiment config cannot produce an
+ * invalid cuVS request. */
+static size_t sk_env_size(const char* name, size_t fallback, size_t lo, size_t hi)
+{
+  const char* raw = getenv(name);
+  if (raw == NULL || *raw == '\0') return fallback;
+  char* end = NULL;
+  long long parsed = strtoll(raw, &end, 10);
+  if (end == raw || *end != '\0' || parsed < 0) return fallback;
+  if ((size_t)parsed < lo) return lo;
+  if ((size_t)parsed > hi) return hi;
+  return (size_t)parsed;
+}
+
 void* seekdb_cuvs_build(const float* base, long n, long dim)
 {
   size_t bytes = 0;
@@ -105,11 +124,13 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
   dset.dl_tensor.dtype.bits = 32;
   dset.dl_tensor.dtype.lanes = 1;
   dset.dl_tensor.shape = shape;
-  /* Preserve the V5 graph-quality settings until paired GPU recall is measured. */
-  h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 256;
-  h->ip->nn_descent_niter = 100;
+  h->ip->build_algo = (enum cuvsCagraGraphBuildAlgo)
+      sk_env_size("OBCUVS_BUILD_ALGO", (size_t)NN_DESCENT, 0, 3);
+  h->ip->graph_degree = sk_env_size("OBCUVS_GRAPH_DEGREE", 128, 16, 512);
+  h->ip->intermediate_graph_degree = sk_env_size("OBCUVS_INTERMEDIATE_DEGREE", 256, 16, 1024);
+  if (h->ip->intermediate_graph_degree < h->ip->graph_degree)
+    h->ip->intermediate_graph_degree = h->ip->graph_degree;
+  h->ip->nn_descent_niter = sk_env_size("OBCUVS_NNDESCENT_NITER", 100, 1, 500);
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS ||
       cuvsStreamSync(h->res) != CUVS_SUCCESS) {
     fprintf(stderr, "[seekdb_cuvs] build failed: %s\n", cuvsGetLastErrorText());
@@ -135,6 +156,8 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
   if (!h->sp) {
     if (cuvsCagraSearchParamsCreate(&h->sp) != CUVS_SUCCESS) { rc = 14; goto done; }
     h->default_itopk = h->sp->itopk_size;
+    h->itopk_min = sk_env_size("OBCUVS_ITOPK_MIN", 512, 64, 4096);
+    h->search_width = sk_env_size("OBCUVS_SEARCH_WIDTH", 4, 1, 16);
   }
   if (!sk_reserve(h, &h->query, &h->query_bytes, query_bytes)) { rc = 10; goto done; }
   if (!sk_reserve(h, &h->ids, &h->ids_bytes, output_bytes)) { rc = 11; goto done; }
@@ -145,11 +168,11 @@ int seekdb_cuvs_search(void* handle, const float* query, long nq, long topk,
     memset(&qt, 0, sizeof(qt));
     int64_t qs[2] = {nq, h->dim}, os[2] = {nq, topk};
     size_t required_itopk = (size_t)topk * 4;
-    if (required_itopk < 512) required_itopk = 512;
+    if (required_itopk < h->itopk_min) required_itopk = h->itopk_min;
     if (required_itopk < h->default_itopk) required_itopk = h->default_itopk;
     /* Reset each call: a previous larger k must not change this query's work. */
     h->sp->itopk_size = required_itopk;
-    h->sp->search_width = 4;
+    h->sp->search_width = h->search_width;
     qt.dl_tensor.data = h->query;
     qt.dl_tensor.device.device_type = kDLCUDA;
     qt.dl_tensor.ndim = 2;
